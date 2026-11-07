@@ -1,15 +1,18 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/introspect"
 	"github.com/godbus/dbus/v5/prop"
 
+	"github.com/singularityos-lab/sinty-speechd/internal/catalog"
 	"github.com/singularityos-lab/sinty-speechd/internal/engine"
 	"github.com/singularityos-lab/sinty-speechd/internal/speech"
 )
@@ -56,10 +59,13 @@ type Service struct {
 	props    *prop.Properties
 	mu       sync.Mutex
 	settings Settings
+	catalog  *catalog.Catalog
+	neural   bool
+	installs map[string]context.CancelFunc
 }
 
-func New(conn *dbus.Conn, queue *speech.Queue, engines *engine.Set, settingsPath string) (*Service, error) {
-	s := &Service{conn: conn, queue: queue, engines: engines, path: settingsPath, settings: LoadSettings(settingsPath)}
+func New(conn *dbus.Conn, queue *speech.Queue, engines *engine.Set, settingsPath string, voices *catalog.Catalog, neural bool) (*Service, error) {
+	s := &Service{conn: conn, queue: queue, engines: engines, path: settingsPath, settings: LoadSettings(settingsPath), catalog: voices, neural: neural, installs: map[string]context.CancelFunc{}}
 	if err := conn.Export(s, Path, Iface); err != nil {
 		return nil, err
 	}
@@ -92,10 +98,12 @@ func New(conn *dbus.Conn, queue *speech.Queue, engines *engine.Set, settingsPath
 			}
 			return ok
 		})},
-		"Rate":     {Value: s.settings.Rate, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0.25, 4, func(st *Settings, f float64) { st.Rate = f }))},
-		"Pitch":    {Value: s.settings.Pitch, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0.25, 2, func(st *Settings, f float64) { st.Pitch = f }))},
-		"Volume":   {Value: s.settings.Volume, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0, 2, func(st *Settings, f float64) { st.Volume = f }))},
-		"Speaking": {Value: false, Emit: prop.EmitTrue},
+		"Rate":         {Value: s.settings.Rate, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0.25, 4, func(st *Settings, f float64) { st.Rate = f }))},
+		"Pitch":        {Value: s.settings.Pitch, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0.25, 2, func(st *Settings, f float64) { st.Pitch = f }))},
+		"Volume":       {Value: s.settings.Volume, Writable: true, Emit: prop.EmitTrue, Callback: writable(number(0, 2, func(st *Settings, f float64) { st.Volume = f }))},
+		"Speaking":     {Value: false, Emit: prop.EmitTrue},
+		"Paused":       {Value: false, Emit: prop.EmitTrue},
+		"NeuralVoices": {Value: neural, Emit: prop.EmitFalse},
 	}})
 	if err != nil {
 		return nil, err
@@ -110,7 +118,10 @@ func New(conn *dbus.Conn, queue *speech.Queue, engines *engine.Set, settingsPath
 			Signals: []introspect.Signal{
 				{Name: "Started", Args: []introspect.Arg{{Name: "job", Type: "u"}}},
 				{Name: "Sentence", Args: []introspect.Arg{{Name: "job", Type: "u"}, {Name: "offset", Type: "i"}, {Name: "length", Type: "i"}}},
+				{Name: "Word", Args: []introspect.Arg{{Name: "job", Type: "u"}, {Name: "offset", Type: "i"}, {Name: "length", Type: "i"}}},
 				{Name: "Finished", Args: []introspect.Arg{{Name: "job", Type: "u"}, {Name: "completed", Type: "b"}}},
+				{Name: "VoiceProgress", Args: []introspect.Arg{{Name: "key", Type: "s"}, {Name: "done", Type: "x"}, {Name: "total", Type: "x"}}},
+				{Name: "VoiceInstalled", Args: []introspect.Arg{{Name: "key", Type: "s"}, {Name: "ok", Type: "b"}, {Name: "error", Type: "s"}}},
 			},
 		}},
 	}
@@ -145,19 +156,29 @@ func (s *Service) Current() Settings {
 }
 
 func (s *Service) Event(e speech.Event) {
-	if e.Owner != "" && e.Owner[0] != ':' {
-		s.props.SetMust(Iface, "Speaking", s.queue.Speaking())
+	switch e.Kind {
+	case speech.Started:
+		s.props.SetMust(Iface, "Speaking", true)
+	case speech.Paused:
+		s.props.SetMust(Iface, "Paused", true)
+	case speech.Resumed:
+		s.props.SetMust(Iface, "Paused", false)
+	case speech.Finished, speech.Cancelled, speech.Failed:
+		s.props.SetMust(Iface, "Speaking", false)
+		s.props.SetMust(Iface, "Paused", false)
+	}
+	if e.Owner == "" || e.Owner[0] != ':' {
 		return
 	}
 	switch e.Kind {
 	case speech.Started:
-		s.props.SetMust(Iface, "Speaking", true)
 		s.conn.Emit(Path, Iface+".Started", e.Job)
 	case speech.Spoke:
 		s.conn.Emit(Path, Iface+".Sentence", e.Job, int32(e.Offset), int32(e.Length))
+	case speech.Word:
+		s.conn.Emit(Path, Iface+".Word", e.Job, int32(e.Offset), int32(e.Length))
 	case speech.Finished, speech.Cancelled, speech.Failed:
 		s.conn.Emit(Path, Iface+".Finished", e.Job, e.Kind == speech.Finished)
-		s.props.SetMust(Iface, "Speaking", false)
 	}
 }
 
@@ -185,6 +206,103 @@ func (s *Service) Announce(sender dbus.Sender, text string) (uint32, *dbus.Error
 
 func (s *Service) Stop(sender dbus.Sender) *dbus.Error {
 	s.queue.Cancel(string(sender))
+	return nil
+}
+
+func (s *Service) Pause() *dbus.Error {
+	s.queue.Pause("")
+	return nil
+}
+
+func (s *Service) Resume() *dbus.Error {
+	s.queue.Resume("")
+	return nil
+}
+
+type available struct {
+	Key       string
+	Name      string
+	Language  string
+	Quality   string
+	Size      int64
+	Installed bool
+}
+
+func (s *Service) AvailableVoices(language string) ([]available, *dbus.Error) {
+	if s.catalog == nil || !s.neural {
+		return []available{}, nil
+	}
+	if language == "" {
+		language = os.Getenv("LANG")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	list, err := s.catalog.Voices(ctx, language)
+	if err != nil {
+		return nil, dbus.MakeFailedError(err)
+	}
+	out := []available{}
+	for _, v := range list {
+		out = append(out, available{v.Key, v.Name, v.Language, v.Quality, v.Size, s.catalog.Installed(v.Key)})
+	}
+	return out, nil
+}
+
+func (s *Service) InstallVoice(key string) *dbus.Error {
+	if s.catalog == nil || !s.neural {
+		return dbus.NewError(Iface+".Error.NotSupported", []interface{}{"neural voices are not available"})
+	}
+	s.mu.Lock()
+	if _, busy := s.installs[key]; busy {
+		s.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.installs[key] = cancel
+	s.mu.Unlock()
+	go func() {
+		var last time.Time
+		err := s.catalog.Install(ctx, key, func(done, total int64) {
+			if time.Since(last) > 200*time.Millisecond || done == total {
+				last = time.Now()
+				s.conn.Emit(Path, Iface+".VoiceProgress", key, done, total)
+			}
+		})
+		s.mu.Lock()
+		delete(s.installs, key)
+		s.mu.Unlock()
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		s.conn.Emit(Path, Iface+".VoiceInstalled", key, err == nil, msg)
+	}()
+	return nil
+}
+
+func (s *Service) CancelInstall(key string) *dbus.Error {
+	s.mu.Lock()
+	if cancel, ok := s.installs[key]; ok {
+		cancel()
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) RemoveVoice(key string) *dbus.Error {
+	if s.catalog == nil {
+		return dbus.NewError(Iface+".Error.NotSupported", []interface{}{"neural voices are not available"})
+	}
+	if err := s.catalog.Remove(key); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	s.mu.Lock()
+	if s.settings.Voice == "piper:"+key {
+		s.settings.Voice = ""
+		s.save()
+		s.props.SetMust(Iface, "Voice", "")
+	}
+	s.mu.Unlock()
 	return nil
 }
 

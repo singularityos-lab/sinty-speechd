@@ -128,9 +128,10 @@ func (s *Server) handle(c *client) {
 			s.each(c, f, func(o *client) { s.Queue.Cancel(o.owner()) })
 			c.send(reply(213, nil, "OK CANCELED")...)
 		case "PAUSE":
-			s.each(c, f, func(o *client) { s.Queue.Stop(o.owner()) })
+			s.each(c, f, func(o *client) { s.Queue.Pause(o.owner()) })
 			c.send(reply(211, nil, "OK PAUSED")...)
 		case "RESUME":
+			s.each(c, f, func(o *client) { s.Queue.Resume(o.owner()) })
 			c.send(reply(212, nil, "OK RESUMED")...)
 		case "SET":
 			c.send(s.set(c, f)...)
@@ -397,6 +398,14 @@ func (s *Server) Event(e speech.Event) {
 	case speech.Finished:
 		if c.notify["end"] {
 			c.send(reply(702, head, "END")...)
+		}
+	case speech.Paused:
+		if c.notify["pause"] {
+			c.send(reply(704, head, "PAUSED")...)
+		}
+	case speech.Resumed:
+		if c.notify["resume"] {
+			c.send(reply(705, head, "RESUMED")...)
 		}
 	case speech.Cancelled, speech.Failed:
 		if c.notify["cancel"] {

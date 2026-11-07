@@ -16,6 +16,7 @@ import (
 	"github.com/godbus/dbus/v5"
 
 	"github.com/singularityos-lab/sinty-speechd/internal/audio"
+	"github.com/singularityos-lab/sinty-speechd/internal/catalog"
 	"github.com/singularityos-lab/sinty-speechd/internal/engine"
 	"github.com/singularityos-lab/sinty-speechd/internal/service"
 	"github.com/singularityos-lab/sinty-speechd/internal/speech"
@@ -27,6 +28,13 @@ func dataHome() string {
 		return d
 	}
 	return filepath.Join(os.Getenv("HOME"), ".local/share")
+}
+
+func cacheHome() string {
+	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
+		return d
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache")
 }
 
 func configHome() string {
@@ -93,6 +101,7 @@ func main() {
 	socket := flag.String("socket", socketPath(), "speech-dispatcher compatible socket")
 	settings := flag.String("settings", filepath.Join(configHome(), "sinty-speech", "settings.json"), "file holding the chosen voice, rate, pitch and volume")
 	voices := flag.String("voices", "/usr/share/sinty-speech/voices:"+filepath.Join(dataHome(), "sinty-speech", "voices"), "directories holding Piper voices")
+	voiceList := flag.String("catalog", catalog.DefaultBase, "where the list of downloadable voices and the voices are published")
 	flag.Parse()
 
 	if alive(*socket) {
@@ -103,8 +112,9 @@ func main() {
 		log.Print(err)
 	}
 	out := &audio.Auto{Override: *player}
+	piper := &engine.Piper{Binary: engine.Lookup("piper", "/usr/libexec/sinty-speech"), Dirs: filepath.SplitList(*voices)}
 	engines := &engine.Set{Engines: []engine.Engine{
-		&engine.Piper{Binary: engine.Lookup("piper", "/usr/libexec/sinty-speech"), Dirs: filepath.SplitList(*voices)},
+		piper,
 		&engine.Espeak{Binary: engine.Lookup("espeak-ng")},
 	}}
 
@@ -122,7 +132,9 @@ func main() {
 			server.Event(e)
 		}
 	})
-	svc, err = service.New(conn, queue, engines, *settings)
+	dirs := filepath.SplitList(*voices)
+	downloads := &catalog.Catalog{Base: *voiceList, Cache: filepath.Join(cacheHome(), "sinty-speech", "voices.json"), Dir: dirs[len(dirs)-1], MaxAge: 24 * time.Hour}
+	svc, err = service.New(conn, queue, engines, *settings, downloads, piper.Binary != "")
 	if err != nil {
 		log.Fatal(err)
 	}

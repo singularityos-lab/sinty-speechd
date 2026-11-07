@@ -87,7 +87,9 @@ func TestQueueSpeaksSentencesInOrderWithEvents(t *testing.T) {
 	}
 	var kinds []Kind
 	for _, e := range rec.events {
-		kinds = append(kinds, e.Kind)
+		if e.Kind != Word {
+			kinds = append(kinds, e.Kind)
+		}
 	}
 	want := []Kind{Started, Spoke, Spoke, Marked, Spoke, Finished}
 	if len(kinds) != len(want) {
@@ -130,4 +132,61 @@ func TestCancelOnlyTouchesItsOwner(t *testing.T) {
 	}
 	q.Cancel("a")
 	rec.until(t, a, Cancelled)
+}
+
+func TestWordsFollowThePlayback(t *testing.T) {
+	p := &player{}
+	q, rec := start(t, p)
+	id := q.Speak(Request{Text: "Ciao. Tutto bene oggi?", Owner: "a"})
+	rec.until(t, id, Finished)
+	var words []string
+	text := []rune("Ciao. Tutto bene oggi?")
+	for _, e := range rec.events {
+		if e.Kind == Word {
+			words = append(words, string(text[e.Offset:e.Offset+e.Length]))
+		}
+	}
+	if strings.Join(words, "|") != "Ciao.|Tutto|bene|oggi?" {
+		t.Fatalf("%q", words)
+	}
+}
+
+func TestPauseReplaysTheSentenceOnResume(t *testing.T) {
+	p := &player{hold: make(chan struct{})}
+	q, rec := start(t, p)
+	id := q.Speak(Request{Text: "Uno. Due.", Owner: "a"})
+	rec.until(t, id, Spoke)
+	q.Pause("b")
+	if q.IsPaused() {
+		t.Fatal("another owner paused the speech")
+	}
+	q.Pause("a")
+	rec.until(t, id, Paused)
+	time.Sleep(50 * time.Millisecond)
+	p.mu.Lock()
+	before := len(p.played)
+	p.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("played while paused: %q", p.played)
+	}
+	close(p.hold)
+	q.Resume("a")
+	rec.until(t, id, Finished)
+	if strings.Join(p.played, "|") != "Uno.|Uno.|Due." {
+		t.Fatalf("%q", p.played)
+	}
+}
+
+func TestCancelWhilePausedEndsTheJob(t *testing.T) {
+	p := &player{hold: make(chan struct{})}
+	q, rec := start(t, p)
+	id := q.Speak(Request{Text: "Uno.", Owner: "a"})
+	rec.until(t, id, Spoke)
+	q.Pause("")
+	rec.until(t, id, Paused)
+	q.Cancel("a")
+	rec.until(t, id, Cancelled)
+	next := q.Speak(Request{Text: "Dopo.", Owner: "a"})
+	close(p.hold)
+	rec.until(t, next, Finished)
 }

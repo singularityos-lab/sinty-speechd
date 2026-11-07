@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
+	"unicode"
 
 	"github.com/singularityos-lab/sinty-speechd/internal/audio"
 	"github.com/singularityos-lab/sinty-speechd/internal/engine"
@@ -37,6 +39,9 @@ const (
 	Cancelled
 	Failed
 	Marked
+	Word
+	Paused
+	Resumed
 )
 
 type Event struct {
@@ -65,6 +70,9 @@ type Queue struct {
 	current *job
 	cancel  context.CancelFunc
 	wake    chan struct{}
+	paused  bool
+	resume  chan struct{}
+	part    context.CancelFunc
 }
 
 func NewQueue(engines *engine.Set, player audio.Player, events func(Event)) *Queue {
@@ -144,6 +152,57 @@ func (q *Queue) Cancel(owner string) {
 	}
 }
 
+func (q *Queue) Pause(owner string) {
+	q.mu.Lock()
+	j := q.current
+	if j == nil || q.paused || owner != "" && j.req.Owner != owner {
+		q.mu.Unlock()
+		return
+	}
+	q.paused = true
+	q.resume = make(chan struct{})
+	if q.part != nil {
+		q.part()
+	}
+	q.mu.Unlock()
+	q.emit(Event{Job: j.id, Owner: j.req.Owner, Kind: Paused})
+}
+
+func (q *Queue) Resume(owner string) {
+	q.mu.Lock()
+	j := q.current
+	if j == nil || !q.paused || owner != "" && j.req.Owner != owner {
+		q.mu.Unlock()
+		return
+	}
+	q.paused = false
+	close(q.resume)
+	q.mu.Unlock()
+	q.emit(Event{Job: j.id, Owner: j.req.Owner, Kind: Resumed})
+}
+
+func (q *Queue) IsPaused() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.paused
+}
+
+func (q *Queue) wait(ctx context.Context) bool {
+	q.mu.Lock()
+	if !q.paused {
+		q.mu.Unlock()
+		return ctx.Err() == nil
+	}
+	ch := q.resume
+	q.mu.Unlock()
+	select {
+	case <-ch:
+		return ctx.Err() == nil
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (q *Queue) Speaking() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -179,7 +238,7 @@ func (q *Queue) Run(ctx context.Context) {
 		q.play(jctx, j)
 		cancel()
 		q.mu.Lock()
-		q.current, q.cancel = nil, nil
+		q.current, q.cancel, q.paused, q.part = nil, nil, false, nil
 		q.mu.Unlock()
 	}
 }
@@ -240,13 +299,39 @@ func (q *Queue) play(ctx context.Context, j *job) {
 			return
 		}
 		q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Spoke, Offset: s.Offset, Length: len([]rune(s.Text))})
-		if err := q.Player.Play(ctx, audio.Gain(res.a.PCM, volume), res.a.SampleRate); err != nil {
+		pcm := audio.Gain(res.a.PCM, volume)
+		for {
+			if !q.wait(ctx) {
+				q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Cancelled})
+				return
+			}
+			part, stop := context.WithCancel(ctx)
+			q.mu.Lock()
+			q.part = stop
+			q.mu.Unlock()
+			played := make(chan struct{})
+			words := q.words(part, played, j, s, duration(pcm, res.a.SampleRate))
+			err := q.Player.Play(part, pcm, res.a.SampleRate)
+			if err == nil {
+				close(played)
+			}
+			<-words
+			stop()
+			q.mu.Lock()
+			q.part = nil
+			q.mu.Unlock()
 			if ctx.Err() != nil {
 				q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Cancelled})
-			} else {
-				q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Failed, Err: err})
+				return
 			}
-			return
+			if err != nil && q.IsPaused() {
+				continue
+			}
+			if err != nil {
+				q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Failed, Err: err})
+				return
+			}
+			break
 		}
 	}
 	if ctx.Err() != nil {
@@ -254,4 +339,49 @@ func (q *Queue) play(ctx context.Context, j *job) {
 		return
 	}
 	q.emit(Event{Job: j.id, Owner: r.Owner, Kind: Finished})
+}
+
+func duration(pcm []byte, rate int) time.Duration {
+	if rate <= 0 {
+		return 0
+	}
+	return time.Duration(len(pcm)/2) * time.Second / time.Duration(rate)
+}
+
+func (q *Queue) words(ctx context.Context, played <-chan struct{}, j *job, s Sentence, total time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	runes := []rune(s.Text)
+	type word struct{ start, length int }
+	var list []word
+	for i := 0; i < len(runes); {
+		for i < len(runes) && unicode.IsSpace(runes[i]) {
+			i++
+		}
+		start := i
+		for i < len(runes) && !unicode.IsSpace(runes[i]) {
+			i++
+		}
+		if i > start {
+			list = append(list, word{start, i - start})
+		}
+	}
+	go func() {
+		defer close(done)
+		begin := time.Now()
+		rest := false
+		for _, w := range list {
+			at := total * time.Duration(w.start) / time.Duration(len(runes))
+			if !rest {
+				select {
+				case <-ctx.Done():
+					return
+				case <-played:
+					rest = true
+				case <-time.After(at - time.Since(begin)):
+				}
+			}
+			q.emit(Event{Job: j.id, Owner: j.req.Owner, Kind: Word, Offset: s.Offset + w.start, Length: w.length})
+		}
+	}()
+	return done
 }

@@ -31,14 +31,38 @@ The service owns `dev.sinty.Speech1` on the session bus at
 | `Announce(text)` | in `s`, out `u` | Interrupts what is being said and drops the queue. |
 | `Preview(voice)` | in `s`, out `u` | Says a short sentence in the language of the voice. |
 | `Stop()` | | Cancels everything the caller queued. |
+| `Pause()`, `Resume()` | | Pause and resume what is being said. A paused sentence is said again from its start. |
 | `ListVoices()` | out `aas` | Id, name, language and engine of every voice. |
 | `Started(job)` | signal `u` | |
 | `Sentence(job, offset, length)` | signal `uii` | The sentence being spoken, in characters of the text. |
+| `Word(job, offset, length)` | signal `uii` | The word being spoken, timed on the audio of its sentence. |
 | `Finished(job, completed)` | signal `ub` | `completed` is false when the job was cancelled or failed. |
+
+### Downloadable voices
+
+When Piper is installed (`NeuralVoices` is true), the voices published in
+the [Piper voice list](https://huggingface.co/rhasspy/piper-voices) can be
+installed for the user:
+
+| Member | Signature | |
+|---|---|---|
+| `AvailableVoices(language)` | in `s`, out `a(ssssxb)` | Key, name, language, quality, download size and whether it is installed, for the language given or the one in `LANG`. |
+| `InstallVoice(key)` | in `s` | Starts the download into `~/.local/share/sinty-speech/voices`. |
+| `CancelInstall(key)` | in `s` | |
+| `RemoveVoice(key)` | in `s` | |
+| `VoiceProgress(key, done, total)` | signal `sxx` | |
+| `VoiceInstalled(key, ok, error)` | signal `sbs` | |
+
+Every file is checked against the size and MD5 digest of the voice list
+before it is put in place; a file that does not match is deleted. The list is
+cached for a day in `~/.cache/sinty-speech/voices.json`, and `-catalog`
+points the service at another copy of it.
+
+### Settings
 
 `Voice`, `Rate` (0.25 to 4), `Pitch` (0.25 to 2) and `Volume` (0 to 2) are
 writable properties kept in `~/.config/sinty-speech/settings.json`.
-`Speaking` tells whether anything is being said.
+`Speaking` and `Paused` tell what the service is doing.
 
 ```sh
 gdbus call --session --dest dev.sinty.Speech1 --object-path /dev/sinty/Speech1 \
@@ -52,8 +76,8 @@ Orca, `spd-say` and the other speech-dispatcher clients connect to
 where the service speaks the SSIP protocol: `SPEAK`, `CHAR`, `KEY`, `STOP`,
 `CANCEL`, `SET` for the client name, priority, output module, language,
 voice, rate, pitch, volume and notifications, `GET`, `LIST`, `BLOCK`,
-`HISTORY GET CLIENT_ID` and `QUIT`, with the `BEGIN`, `END`, `CANCELLED` and
-`INDEX MARK` notifications. SSML is accepted and its `mark` elements are
+`HISTORY GET CLIENT_ID`, `PAUSE`, `RESUME` and `QUIT`, with the `BEGIN`,
+`END`, `CANCELLED`, `PAUSED`, `RESUMED` and `INDEX MARK` notifications. SSML is accepted and its `mark` elements are
 reported as index marks.
 
 The `important` and `message` priorities interrupt lower priority speech and
