@@ -13,5 +13,3 @@ By submitting a contribution (e.g., pull request, commit), you agree to this CLA
 5. The project owner has final decision-making authority on contributions and project direction, solely to resolve conflicts, avoid fragmentation, and maintain a consistent vision for the project.
 
 6. You confirm that you have the right to submit this contribution.
-
-
